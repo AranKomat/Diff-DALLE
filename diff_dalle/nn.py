@@ -3,6 +3,7 @@ Various utilities for neural networks.
 """
 
 import math
+import numpy as np
 
 import torch as th
 import torch.nn as nn
@@ -210,20 +211,37 @@ class FFN(nn.Module):
     
 def clip_loss(image_features, text_features, logit_scale):
     rank = dist.get_rank()
-    bs_img = len(image_features)
-    bs_txt = len(text_features)
+    
+    bs = len(image_features)
+    
     text_features_all = [th.zeros_like(text_features) for _ in range(dist.get_world_size())]
     image_features_all = [th.zeros_like(image_features) for _ in range(dist.get_world_size())]
+    
     dist.all_gather(text_features_all, text_features)
     dist.all_gather(image_features_all, image_features)  
     
     # image loss
-    ground_truth = th.arange(rank*bs_txt, rank*bs_txt + bs_img, device=image_features.device)
+    ground_truth = th.arange(rank*bs, (rank+1)*bs, device=image_features.device)
     loss_image = F.cross_entropy(logit_scale * image_features @ th.cat(text_features_all).t(), ground_truth)
 
     # text loss
-    text_features = text_features[:bs_img]
-    ground_truth = th.arange(rank*bs_img, (rank+1)*bs_img, device=text_features.device)
+    ground_truth = th.arange(rank*bs, (rank+1)*bs, device=text_features.device)
     loss_text = F.cross_entropy(logit_scale * text_features @ th.cat(image_features_all).t(), ground_truth)
 
     return (loss_image + loss_text) / 2
+
+
+def approx_clip_loss(img_embs, txt_embs, logit_scale, saved_img_embs, saved_txt_embs, contra_batch_size):
+    ids = np.random.choice(len(saved_img_embs), contra_batch_size, replace=False)
+    saved_img_embs, saved_txt_embs = saved_img_embs[ids], saved_txt_embs[ids]
+    
+    positives = th.einsum('bd,bd->b', img_embs, txt_embs).unsqueeze(-1) 
+    negatives_img_txt = th.einsum('bd,sd->bs', img_embs, saved_txt_embs) 
+    negatives_txt_img = th.einsum('bd,sd->bs', txt_embs, saved_img_embs) 
+    ground_truth = img_embs.new_zeros(len(x))
+    
+    def loss(logits):
+        logits = torch.cat([positives, logits], dim=-1)
+        return F.cross_entropy(logit_scale * logits, ground_truth)
+        
+    return loss(negatives_img_text) + loss(negatives_txt_img) / 2

@@ -15,6 +15,7 @@ from torch.nn.parallel.distributed import DistributedDataParallel as DDP
 from torch.optim import AdamW
 
 from diff_dalle import dist_util, logger
+from diff_dalle.dist_util import cached
 from diff_dalle.nn import clip_loss 
 from diff_dalle.fp16_util import MixedPrecisionTrainer
 from diff_dalle.datasets import load_data
@@ -66,7 +67,7 @@ def main():
         model=model, use_fp16=args.use_fp16, initial_lg_loss_scale=16.0
     )
 
-    model = DDP(
+    model_fn = lambda model: DDP(
         model,
         device_ids=[dist_util.dev()],
         output_device=dist_util.dev(),
@@ -74,25 +75,24 @@ def main():
         bucket_cap_mb=128,
         find_unused_parameters=False,
     )
+    
+    ddp_model = {"text": model_fn(model.text_encoder), "image": model_fn(model.image_encoder), "scale": model_fn(model.logit_scale)}
 
     logger.log("creating data loader...")
     data = load_data(
         index_dir=args.index_dir,
-        data_dir=args.data_dir,
-        batch_size=args.batch_size,
+        batch_size=args.microbatch,
         image_size=args.image_size,
         random_crop=True,
         text_length=args.text_length,
-        text_aug_factor=args.text_aug_factor,
+        num_workers=8,
     )
-    if args.data_dir_val:
+    if args.index_dir_val:
         val_data = load_data(
             index_dir=args.index_dir_val,
-            data_dir=args.data_dir_val,
-            batch_size=args.batch_size,
+            batch_size=args.microbatch,
             image_size=args.image_size,
             text_length=args.text_length,
-            text_aug_factor=args.text_aug_factor,
             phase='valid',
         )
     else:
@@ -111,36 +111,71 @@ def main():
         )
 
     logger.log("training classifier model...")
-
-    def forward_backward_log(data_loader, prefix="train"):
-        batch, cond = next(data_loader)
-        batch = batch.to(dist_util.dev())
-        # Noisy images
-        if args.noised:
-            t, _ = schedule_sampler.sample(batch.shape[0], dist_util.dev())
-            batch = diffusion.q_sample(batch, t)
-        else:
-            t = th.zeros(batch.shape[0], dtype=th.long, device=dist_util.dev())
+    
+    def print_time(name, t):
+        rank = dist.get_rank()
+        print(name, rank, args.batch_size / (time() - t))
         
+    def forward_backward_log(data_loader, prefix="train"):
+        cache_x = []
+        cache_y = []
+        closuresx = []
+        closuresy = []
+        aggregate = lambda x: th.cat(x)
         microbatch = args.microbatch if args.microbatch > 0 else args.batch_size
-        num_microbatches = batch.shape[0] // microbatch
-        microbatching = lambda x: x.chunk(num_microbatches)
-        batch, t = map(microbatching, (batch, t))
-        cond = {k: microbatching(v) for k, v in cond.items()}
-        for i in range(num_microbatches):
-            micro = batch[i]
-            micro_t = t[i]
-            micro_cond = {
-                k: v[i].to(dist_util.dev())
-                for k, v in cond.items()
-            }
-            loss = clip_loss(*model(micro, micro_t, **micro_cond))            
-            logger.logkv_mean(f"{prefix}_loss", loss.detach().item())
-            if loss.requires_grad:
-                if i == 0:
-                    mp_trainer.zero_grad()
-                mp_trainer.backward(loss * len(micro) / len(batch))                
+        num_microbatches = args.batch_size // microbatch
 
+        for i in range(num_microbatches):
+            t = time()
+            micro, micro_cond = next(data_loader)
+            micro = micro.to(dist_util.dev())
+            micro_text = micro_cond.to(dist_util.dev())
+            # Noisy images
+            if args.noised:
+                micro_t, _ = schedule_sampler.sample(micro.size(0), dist_util.dev())
+                micro = diffusion.q_sample(micro, micro_t)
+            else:
+                micro_t = th.zeros(micro.size(0), dtype=th.long, device=dist_util.dev())
+
+            last_step = i == num_microbatches - 1
+
+            if num_microbatches == 1:
+                out_img = ddp_model["image"](micro, micro_t)
+                out_txt = ddp_model["text"](micro_text)
+                logit_scale = ddp_model["scale"](out_img.dtype)
+                loss = clip_loss(out_img, out_txt, logit_scale)
+                mp_trainer.backward(loss)                            
+                
+            elif prefix == "train":
+                rx, cx = cached(ddp_model["image"], last_step)(micro, micro_t)
+                ry, cy = cached(ddp_model["text"], last_step)(micro_text)
+
+                cache_x.append(rx)
+                cache_y.append(ry)
+                closuresx.append(cx)
+                closuresy.append(cy)
+                
+                if last_step:
+                    logit_scale = ddp_model["scale"](rx.dtype)
+                    loss = clip_loss(*map(aggregate, (cache_x, cache_y)), logit_scale)
+                    logger.logkv_mean(f"{prefix}_loss", loss.detach().item())
+                    mp_trainer.backward(loss)            
+
+                    for f, r in zip(closuresx, cache_x):
+                        f(r)
+                    for f, r in zip(closuresy, cache_y):
+                        f(r)
+            else:
+                rx, ry = ddp_model["image"](micro, micro_t), ddp_model["text"](micro_text) 
+                cache_x.append(rx)
+                cache_y.append(ry)
+                if last_step:
+                    logit_scale = ddp_model["scale"](rx.dtype)
+                    cache_x, cache_y = map(aggregate, (cache_x, cache_y))
+                    loss = clip_loss(cache_x, cache_y, logit_scale)  
+                    logger.logkv_mean(f"{prefix}_loss", loss.detach().item())
+        
+        
     for step in range(args.iterations - resume_step):
         logger.logkv("step", step + resume_step)
         logger.logkv(
@@ -149,16 +184,17 @@ def main():
         )
         if args.anneal_lr:
             set_annealed_lr(opt, args.lr, step=step + resume_step, total_steps=args.iterations, warmup_steps=args.warmup_steps)
-        t = time()
-        forward_backward_log(data)
-        mp_trainer.optimize(opt)
-        #print(args.batch_size / (time() - t))
         if val_data is not None and not step % args.eval_interval:
             with th.no_grad():
                 with model.no_sync():
                     model.eval()
                     forward_backward_log(val_data, prefix="val")
                     model.train()
+        t = time()
+        forward_backward_log(data)
+        mp_trainer.optimize(opt)
+        mp_trainer.zero_grad()                
+        print_time("step", t)
         if not step % args.log_interval:
             logger.dumpkvs()
         if (step
@@ -196,23 +232,20 @@ def create_argparser():
     defaults = dict(
         index_dir=None,
         index_dir_val=None,
-        data_dir="",
-        data_dir_val="",
         noised=True,
-        iterations=300000,
-        lr=3e-4,
-        weight_decay=0.1,
+        iterations=400000,
+        lr=5e-4,
+        weight_decay=0.2,
         anneal_lr=True,
         warmup_steps=3000,
         batch_size=64,
-        text_length=48,
+        text_length=64,
         microbatch=-1,
-        text_aug_factor=1,
         schedule_sampler="uniform",
         clip_resume_checkpoint="",
         log_interval=1000,
         eval_interval=1000,
-        save_interval=10000,
+        save_interval=40000,
     )
     defaults.update(classifier_and_diffusion_defaults())
     parser = argparse.ArgumentParser()

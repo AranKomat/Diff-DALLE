@@ -5,7 +5,7 @@ from . import gaussian_diffusion as gd
 from .respace import SpacedDiffusion, space_timesteps
 from .unet import UNetModel, Classifier, SuperResModel
 
-VOCAB_SIZE = 50257
+VOCAB_SIZE = 49408
 
 
 def diffusion_defaults():
@@ -39,7 +39,7 @@ def classifier_defaults():
         use_checkpoint=False,
         vocab_size=VOCAB_SIZE,
         classifier_enc_attn_dim=512,
-        dropout_text=0,
+        dropout_text=0.0,
     )
 
 
@@ -66,12 +66,10 @@ def model_and_diffusion_defaults():
         use_fp16=True,
         use_new_attention_order=False,
         vocab_size=VOCAB_SIZE,
-        #vocab_size=50265,
         enc_attn_dim=768,
-        text_level=False,
         classifier_resume_checkpoint=None,
-        clip_coeff=0.,
-        dropout_text=0,
+        dropout_text=0.0,
+        cond_text=False,
     )
     res.update(diffusion_defaults())
     return res
@@ -109,10 +107,9 @@ def create_model_and_diffusion(
     use_new_attention_order,
     vocab_size,
     enc_attn_dim,
-    text_level,
     classifier_resume_checkpoint,
-    clip_coeff,
     dropout_text,
+    cond_text,
 ):
     model = create_model(
         image_size,
@@ -132,9 +129,9 @@ def create_model_and_diffusion(
         use_new_attention_order=use_new_attention_order,
         vocab_size=vocab_size,
         enc_attn_dim=enc_attn_dim,
-        text_level=text_level,
         small_size=small_size,
         dropout_text=dropout_text,
+        cond_text=cond_text,
     )
     diffusion = create_gaussian_diffusion(
         steps=diffusion_steps,
@@ -145,7 +142,6 @@ def create_model_and_diffusion(
         rescale_timesteps=rescale_timesteps,
         rescale_learned_sigmas=rescale_learned_sigmas,
         timestep_respacing=timestep_respacing,
-        clip_coeff=clip_coeff,
     )
     return model, diffusion
 
@@ -168,12 +164,14 @@ def create_model(
     use_new_attention_order=False,
     vocab_size=None,
     enc_attn_dim=None,
-    text_level=False,
     small_size=0,
-    dropout_text=0,
+    dropout_text=0.0,
+    cond_text=False,
 ):
     if channel_mult == "":
-        if image_size == 512:
+        if image_size == 1024:
+            channel_mult = (1, 1, 2, 2, 4, 4)
+        elif image_size == 512:
             channel_mult = (1, 1, 2, 2, 4, 4)
         elif image_size == 256:
             channel_mult = (1, 1, 2, 2, 4, 4)
@@ -181,6 +179,8 @@ def create_model(
             channel_mult = (1, 1, 2, 3, 4)
         elif image_size == 64:
             channel_mult = (1, 2, 3, 4)
+        elif image_size == 32:
+            channel_mult = (1, 2, 4)
         else:
             raise ValueError(f"unsupported image size: {image_size}")
     else:
@@ -211,8 +211,8 @@ def create_model(
         use_new_attention_order=use_new_attention_order,
         vocab_size=vocab_size,
         enc_attn_dim=enc_attn_dim,
-        text_level=text_level,
         dropout_text=dropout_text,
+        cond_text=cond_text,
     )
 
 
@@ -318,7 +318,6 @@ def create_gaussian_diffusion(
     rescale_timesteps=False,
     rescale_learned_sigmas=False,
     timestep_respacing="",
-    clip_coeff=0.,
 ):
     betas = gd.get_named_beta_schedule(noise_schedule, steps)
     if use_kl:
@@ -346,7 +345,6 @@ def create_gaussian_diffusion(
         ),
         loss_type=loss_type,
         rescale_timesteps=rescale_timesteps,
-        clip_coeff=clip_coeff,
     )
 
 

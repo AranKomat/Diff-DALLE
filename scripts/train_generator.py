@@ -16,38 +16,27 @@ from diff_dalle.script_util import (
     add_dict_to_argparser,
 )
 from diff_dalle.train_util import TrainLoop
+import torch
 
 
 def main():
     args = create_argparser().parse_args()
-
     dist_util.setup_dist()
     logger.configure()
-
     logger.log("creating model and diffusion...")
     model, diffusion = create_model_and_diffusion(
         **args_to_dict(args, model_and_diffusion_defaults().keys())
     )
     model.to(dist_util.dev())
     schedule_sampler = create_named_schedule_sampler(args.schedule_sampler, diffusion)
-
-    clip = None
-    logger.log(args)
-    if args.clip_coeff > 0:
-        clip, _ = create_classifier_and_diffusion(
-            **args_to_dict(args, classifier_and_diffusion_defaults().keys())
-        )
-        clip.to(dist_util.dev()).eval()
     
     logger.log("creating data loader...")
     data = load_data(
         index_dir=args.index_dir,
-        data_dir=args.data_dir,
         batch_size=args.batch_size,
         image_size=args.image_size,
         small_size=args.small_size,
         text_length=args.text_length,
-        text_aug_factor=args.text_aug_factor,
         gaussian_blur=args.gaussian_blur,
     )
 
@@ -69,15 +58,12 @@ def main():
         weight_decay=args.weight_decay,
         lr_anneal_steps=args.lr_anneal_steps,
         warmup_steps=args.warmup_steps,
-        clip=clip,
-        clip_checkpoint=args.classifier_resume_checkpoint,
     ).run_loop()
 
 
 def create_argparser():
     defaults = dict(
         index_dir=None,
-        data_dir="",
         schedule_sampler="uniform",
         lr=3e-4,
         weight_decay=0.0,
@@ -86,12 +72,11 @@ def create_argparser():
         batch_size=1,
         microbatch=-1,  # -1 disables microbatches
         ema_rate="0.9999",  # comma-separated list of EMA values
-        text_aug_factor=1,
         log_interval=100,
         save_interval=2500,
         resume_checkpoint="",
         fp16_scale_growth=1e-3,
-        text_length=48,
+        text_length=64,
         gaussian_blur=False,
     )
     defaults.update(model_and_diffusion_defaults())

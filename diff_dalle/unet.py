@@ -6,7 +6,6 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 
 from .fp16_util import convert_module_to_f16, convert_module_to_f32, convert_module_to_f16_2
 from .nn import (
@@ -450,12 +449,12 @@ class QKVAttention(nn.Module):
     
     
 class TransformerEncoder(nn.Module):
-    def __init__(self, enc_attn_dim, vocab_size, use_checkpoint, clip=False, time_embed_dim=None, text_level=False, dropout=0.):
+    def __init__(self, enc_attn_dim, vocab_size, use_checkpoint, clip=False, dropout=0.):
         super().__init__()
         d_model = enc_attn_dim
         self.use_checkpoint = use_checkpoint
         self.encoder = nn.ModuleList([])
-        for _ in range(d_model//128):
+        for _ in range(d_model//64):
             self.encoder += [AttentionBlock(d_model, num_heads=d_model//64, norm_type='layernorm', cross=False, use_checkpoint=use_checkpoint, dropout=dropout)]
             self.encoder += [FFN(d_model, dropout=dropout)]
                                           
@@ -464,26 +463,16 @@ class TransformerEncoder(nn.Module):
         
         if clip:
             self.clip_proj = conv_nd(1, enc_attn_dim, enc_attn_dim, 1)
-            self.logit_scale = nn.Parameter(th.ones([]) * np.log(1 / 0.07))
-            self.max_log_temp = np.log(100)
-        
-        if text_level:
-            self.encoder_seq_proj = conv_nd(1, enc_attn_dim, time_embed_dim, 1)
 
-    def forward(self, x):
-        x = self.pos_enc(self.emb(x)).transpose(1, 2)
+    def forward(self, text):
+        x = self.pos_enc(self.emb(text)).transpose(1, 2)
         for idx, layer in enumerate(self.encoder):
             x = checkpoint(layer.forward, (x,), layer.parameters(), self.use_checkpoint)
 
         if not hasattr(self, 'clip_proj'):
-            if hasattr(self, 'encoder_seq_proj'):
-                return x, self.encoder_seq_proj(x[..., -1:]).squeeze(-1)
-            else:
-                return x
+            return x
         else:
-            x = self.clip_proj(x[..., -1:]).squeeze(-1)
-            logit_scale = self.max_log_temp - F.softplus(self.max_log_temp - self.logit_scale)            
-            return x, logit_scale.type(x.dtype)
+            return self.clip_proj(x[th.arange(x.shape[0]), :, text.argmax(dim=-1)].unsqueeze(-1)).squeeze(-1)
                 
 
 class UNetModel(nn.Module):
@@ -542,6 +531,7 @@ class UNetModel(nn.Module):
         cross=True,
         text_level=False,
         dropout_text=0,
+        cond_text=False,
     ):
         super().__init__()
 
@@ -562,7 +552,8 @@ class UNetModel(nn.Module):
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
-        self.text_level = text_level
+        
+        self.cond_text = cond_text
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -570,8 +561,10 @@ class UNetModel(nn.Module):
             nn.SiLU(),
             linear(time_embed_dim, time_embed_dim),
         )
-
-        self.text_encoder = TransformerEncoder(enc_attn_dim, vocab_size, use_checkpoint, time_embed_dim=time_embed_dim, text_level=text_level, dropout=dropout_text)
+        if self.cond_text:
+            self.text_encoder = TransformerEncoder(enc_attn_dim, vocab_size, use_checkpoint, dropout=dropout_text)
+        else:
+            cross = False
 
         self.input_blocks = nn.ModuleList(
             [
@@ -728,7 +721,8 @@ class UNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f16)
         self.middle_block.apply(convert_module_to_f16)
         self.output_blocks.apply(convert_module_to_f16)
-        self.text_encoder.apply(convert_module_to_f16_2)
+        if hasattr(self, 'text_encoder'):
+            self.text_encoder.apply(convert_module_to_f16_2)
 
     def convert_to_fp32(self):
         """
@@ -737,7 +731,8 @@ class UNetModel(nn.Module):
         self.input_blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
-        self.text_encoder.apply(convert_module_to_f32)
+        if hasattr(self, 'text_encoder'):
+            self.text_encoder.apply(convert_module_to_f32)
             
     def forward(self, x, timesteps, y=None):
         """
@@ -752,11 +747,10 @@ class UNetModel(nn.Module):
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
         
-        if self.text_level:
-            y, text_level_emb = self.text_encoder(y[:len(x)]) 
-            emb += text_level_emb
+        if hasattr(self, 'text_encoder'):
+            y = self.text_encoder(y) 
         else:
-            y = self.text_encoder(y[:len(x)]) 
+            y = None
             
         h = x.type(self.dtype)
         for module in self.input_blocks:
@@ -780,20 +774,19 @@ class SuperResModel(UNetModel):
     def __init__(self, image_size, in_channels, *args, **kwargs):
         super().__init__(image_size, in_channels * 2, *args, **kwargs)
 
-    def forward(self, x, timesteps, low_res=None, **kwargs):
+    def forward(self, x, timesteps, **kwargs):
         _, _, new_height, new_width = x.shape
-        upsampled = F.interpolate(low_res, (new_height, new_width), mode="bilinear")
+        upsampled = F.interpolate(kwargs.pop("low_res"), (new_height, new_width), mode="bilinear")
         x = th.cat([x, upsampled], dim=1)
         return super().forward(x, timesteps, **kwargs)
 
-
+    
 class Classifier(nn.Module):
     """
     The half UNet model with attention and timestep embedding + text encoder as CLIP.
 
-    For usage, see UNet.
     """
-
+    
     def __init__(
         self,
         image_size,
@@ -817,6 +810,101 @@ class Classifier(nn.Module):
         vocab_size=None,
         cross=False,
         dropout_text=0,
+    ):
+        super().__init__()
+        self.image_encoder = ImageEncoder(
+            image_size,
+            in_channels,
+            model_channels,
+            num_res_blocks,
+            attention_resolutions,
+            dropout=dropout,
+            channel_mult=channel_mult,
+            conv_resample=conv_resample,
+            dims=dims,
+            use_checkpoint=use_checkpoint,
+            use_fp16=use_fp16,
+            num_heads=num_heads,
+            num_head_channels=num_head_channels,
+            num_heads_upsample=num_heads_upsample,
+            use_scale_shift_norm=use_scale_shift_norm,
+            resblock_updown=resblock_updown,
+            use_new_attention_order=use_new_attention_order,
+            enc_attn_dim=enc_attn_dim,
+            cross=cross,
+            )
+        self.text_encoder = TransformerEncoder(enc_attn_dim, vocab_size, use_checkpoint, clip=True, dropout=dropout_text)
+        self.logit_scale = LogitScale()
+
+    def convert_to_fp16(self):
+        self.text_encoder.apply(convert_module_to_f16_2)
+        self.image_encoder.apply(convert_module_to_f16)
+            
+    def convert_to_fp32(self):
+        self.text_encoder.apply(convert_module_to_f32)
+        self.image_encoder.apply(convert_module_to_f32)        
+    
+    def clip_loss(x, timesteps, y):
+        image_features = self.image_encoder(x, timesteps)
+        text_features = self.text_encoder(y)
+        logit_scale = self.logit_scale(image_features.dtype)
+        return clip_loss(image_features, text_features, logit_scale)
+
+    
+class LogitScale(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.logit_scale = nn.Parameter(th.ones([]) * np.log(1 / 0.07))
+        self.max_log_temp = np.log(100)
+    
+    def forward(self, dtype):
+        logit_scale = self.max_log_temp - F.softplus(self.max_log_temp - self.logit_scale)            
+        return logit_scale.exp().type(dtype)
+    
+    
+class TextEncoder(nn.Module):
+    def __init__(
+        self,
+        enc_attn_dim,
+        vocab_size,
+        use_checkpoint,
+        dropout_text,
+    ):
+        super().__init__()
+        self.text_encoder = TransformerEncoder(enc_attn_dim, vocab_size, use_checkpoint, clip=True, dropout=dropout_text)
+        
+    def forward(self, y):
+        text_features = self.text_encoder(y) 
+        return F.normalize(text_features, dim=-1)
+    
+
+class ImageEncoder(nn.Module):
+    """
+    The half UNet model with attention and timestep embedding.
+    
+    """
+
+    def __init__(
+        self,
+        image_size,
+        in_channels,
+        model_channels,
+        num_res_blocks,
+        attention_resolutions,
+        dropout=0,
+        channel_mult=(1, 2, 4, 8),
+        conv_resample=True,
+        dims=2,
+        use_checkpoint=False,
+        use_fp16=True,
+        num_heads=1,
+        num_head_channels=-1,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=True,
+        resblock_updown=True,
+        use_new_attention_order=False,
+        enc_attn_dim=None,
+        cross=False,
     ):
         super().__init__()
 
@@ -843,7 +931,6 @@ class Classifier(nn.Module):
             linear(time_embed_dim, time_embed_dim),
         )
         
-        self.text_encoder = TransformerEncoder(enc_attn_dim, vocab_size, use_checkpoint, clip=True, dropout=dropout_text)
 
         self.input_blocks = nn.ModuleList(
             [
@@ -944,26 +1031,8 @@ class Classifier(nn.Module):
                 (image_size // ds), ch, num_head_channels, enc_attn_dim
             ),
         )
-
-
-    def convert_to_fp16(self):
-        """
-        Convert the torso of the model to float16.
-        """
-        self.input_blocks.apply(convert_module_to_f16)
-        self.middle_block.apply(convert_module_to_f16)
-        self.out.apply(convert_module_to_f16)
-        self.text_encoder.apply(convert_module_to_f16_2)
-            
-    def convert_to_fp32(self):
-        """
-        Convert the torso of the model to float32.
-        """
-        self.input_blocks.apply(convert_module_to_f32)
-        self.middle_block.apply(convert_module_to_f32)
-        self.text_encoder.apply(convert_module_to_f32)
                 
-    def forward(self, x, timesteps, y):
+    def forward(self, x, timesteps):
         """
         Apply the model to an input batch.
 
@@ -972,7 +1041,6 @@ class Classifier(nn.Module):
         :return: an [N x K] Tensor of outputs.
         """
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
-        text_features, logit_scale = self.text_encoder(y) 
                 
         results = []
         h = x.type(self.dtype)
@@ -982,5 +1050,4 @@ class Classifier(nn.Module):
         image_features = self.out(h)
         # normalized features
         image_features = F.normalize(image_features, dim=-1)
-        text_features = F.normalize(text_features, dim=-1)
-        return image_features, text_features, logit_scale.exp()
+        return image_features

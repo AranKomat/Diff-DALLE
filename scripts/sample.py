@@ -1,5 +1,5 @@
 """
-Like image_sample.py, but use a noisy image classifier to guide the sampling
+Use a noisy image classifier to guide the sampling
 process towards more realistic images.
 """
 
@@ -78,6 +78,7 @@ def main():
         text_length=args.text_length,
         text_aug_factor=args.text_aug_factor,
         phase='valid',
+        text_loader=True,
     )
     
     def cond_fn(x, t, **model_kwargs):

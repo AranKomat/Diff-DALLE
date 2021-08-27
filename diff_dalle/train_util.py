@@ -41,8 +41,6 @@ class TrainLoop:
         weight_decay=0.0,
         lr_anneal_steps=0,
         warmup_steps=0,
-        clip=None,
-        clip_checkpoint=None,
     ):
         self.model = model
         self.diffusion = diffusion
@@ -113,12 +111,8 @@ class TrainLoop:
                 )
             self.use_ddp = False
             self.ddp_model = self.model
-        
-        self.clip = None
-        if clip_checkpoint:
-            self.prepare_clip(clip, clip_checkpoint)
 
-    def _load_and_sync_parameters(self):
+    '''def _load_and_sync_parameters(self):
         resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
 
         if resume_checkpoint:
@@ -130,7 +124,7 @@ class TrainLoop:
                 data = f.read()
             self.model.load_state_dict(th.load(io.BytesIO(data), map_location=dist_util.dev()))
 
-        dist_util.sync_params(self.model.parameters())
+        #dist_util.sync_params(self.model.parameters())
 
     def _load_ema_parameters(self, rate):
         ema_params = copy.deepcopy(self.mp_trainer.master_params)
@@ -145,7 +139,7 @@ class TrainLoop:
                 data = f.read()
             self.mp_trainer.state_dict_to_master_params(th.load(io.BytesIO(data), map_location=dist_util.dev()))
 
-        dist_util.sync_params(ema_params)
+        #dist_util.sync_params(ema_params)
         return ema_params
 
     def _load_optimizer_state(self):
@@ -158,7 +152,51 @@ class TrainLoop:
             dist.barrier()
             with bf.BlobFile(opt_checkpoint, "rb") as f:
                 data = f.read()
-            self.opt.load_state_dict(th.load(io.BytesIO(data), map_location=dist_util.dev()))
+            self.opt.load_state_dict(th.load(io.BytesIO(data), map_location=dist_util.dev()))'''
+    
+    
+    def _load_and_sync_parameters(self):
+        resume_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
+
+        if resume_checkpoint:
+            self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
+            if True: #dist.get_rank() == 0:
+                logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
+                self.model.load_state_dict(
+                    dist_util.load_state_dict(
+                        resume_checkpoint, map_location=dist_util.dev()
+                    )
+                )
+
+        dist_util.sync_params(self.model.parameters())
+
+    def _load_ema_parameters(self, rate):
+        ema_params = copy.deepcopy(self.mp_trainer.master_params)
+
+        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
+        ema_checkpoint = find_ema_checkpoint(main_checkpoint, self.resume_step, rate)
+        if ema_checkpoint:
+            if dist.get_rank() == 0:
+                logger.log(f"loading EMA from checkpoint: {ema_checkpoint}...")
+                state_dict = dist_util.load_state_dict(
+                    ema_checkpoint, map_location=dist_util.dev()
+                )
+                ema_params = self.mp_trainer.state_dict_to_master_params(state_dict)
+
+        dist_util.sync_params(ema_params)
+        return ema_params
+
+    def _load_optimizer_state(self):
+        main_checkpoint = find_resume_checkpoint() or self.resume_checkpoint
+        opt_checkpoint = bf.join(
+            bf.dirname(main_checkpoint), f"opt{self.resume_step:06}.pt"
+        )
+        if bf.exists(opt_checkpoint):
+            logger.log(f"loading optimizer state from checkpoint: {opt_checkpoint}")
+            state_dict = dist_util.load_state_dict(
+                opt_checkpoint, map_location=dist_util.dev()
+            )
+            self.opt.load_state_dict(state_dict)
 
     def run_loop(self):
         while (
@@ -166,8 +204,7 @@ class TrainLoop:
             or self.step + self.resume_step < self.lr_anneal_steps
         ):
             t = time()
-            batch, cond = next(self.data)
-            self.run_step(batch, cond)
+            self.run_step()
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
             if self.step and self.step % self.save_interval == 0:
@@ -176,37 +213,28 @@ class TrainLoop:
                 if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
                     return
             self.step += 1
-            #print(len(batch) / (time() - t))
+            print(self.batch_size / (time() - t))
         # Save the last checkpoint if it wasn't already saved.
         if (self.step - 1) % self.save_interval != 0:
             self.save()
 
-    def run_step(self, batch, cond):
-        self.forward_backward(batch, cond)
+    def run_step(self):
+        self.forward_backward()
         took_step = self.mp_trainer.optimize(self.opt)
         if took_step:
             self._update_ema()
         self._anneal_lr()
         self.log_step()
 
-    def forward_backward(self, batch, cond):
+    def forward_backward(self):
         self.mp_trainer.zero_grad()
         now_time = time()
-        num_microbatches = batch.shape[0] // self.microbatch
-        if self.clip:
-            def microbatching(x):
-                return [x[idx::num_microbatches] for idx in range(num_microbatches)]
-        else:
-            microbatching = lambda x: x.chunk(num_microbatches)
-        batch = microbatching(batch)
-        cond = {k: microbatching(v) for k, v in cond.items()}
+        num_microbatches = self.batch_size // self.microbatch
         for i in range(num_microbatches):
-            micro = batch[i].to(dist_util.dev())
-            micro_cond = {
-                k: v[i].to(dist_util.dev())
-                for k, v in cond.items()
-            }
-
+            micro, micro_cond = next(self.data)
+            micro = micro.to(dist_util.dev())
+            micro_cond = micro_cond.to(dist_util.dev())
+            micro_cond = dict(y=micro_cond) if micro_cond.dim() == 3 else dict(low_res=micro_cond)              
             last_batch = i == num_microbatches - 1
             t, weights = self.schedule_sampler.sample(micro.shape[0], dist_util.dev())
             compute_losses = functools.partial(
@@ -214,8 +242,7 @@ class TrainLoop:
                 self.ddp_model,
                 micro,
                 t,
-                model_kwargs=micro_cond,
-                clip=self.clip,
+                micro_cond,
             )
             if last_batch or not self.use_ddp:
                 losses = compute_losses()
@@ -274,31 +301,6 @@ class TrainLoop:
 
         dist.barrier()
         
-        
-    def prepare_clip(self, clip, clip_resume_checkpoint):
-        resume_step = parse_resume_step_from_filename(clip_resume_checkpoint)
-        if dist.get_rank() == 0:
-            logger.log(
-                f"loading clip from checkpoint: {clip_resume_checkpoint}... at {resume_step} step"
-            )
-        dist.barrier()
-        clip.load_state_dict(
-            dist_util.load_state_dict(
-                clip_resume_checkpoint, map_location=dist_util.dev()
-            )
-        )
-
-        dist_util.sync_params(clip.parameters())
-        clip.convert_to_fp16()
-
-        self.clip = DDP(
-            clip,
-            device_ids=[dist_util.dev()],
-            output_device=dist_util.dev(),
-            broadcast_buffers=False,
-            bucket_cap_mb=128,
-            find_unused_parameters=False,
-        )
 
 def parse_resume_step_from_filename(filename):
     """

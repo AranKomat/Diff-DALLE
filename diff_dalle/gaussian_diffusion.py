@@ -123,7 +123,6 @@ class GaussianDiffusion:
         model_var_type,
         loss_type,
         rescale_timesteps=False,
-        clip_coeff=0,
     ):
         self.model_mean_type = model_mean_type
         self.model_var_type = model_var_type
@@ -169,8 +168,6 @@ class GaussianDiffusion:
             / (1.0 - self.alphas_cumprod)
         )
         
-        self.clip_coeff = clip_coeff
-
     def q_mean_variance(self, x_start, t):
         """
         Get the distribution q(x_t | x_0).
@@ -744,7 +741,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, clip=None):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
         """
         Compute training losses for a single timestep.
 
@@ -814,28 +811,7 @@ class GaussianDiffusion:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
                 terms["loss"] = terms["mse"]
-                
-            if self.clip_coeff != 0:
-                
-                min_log = _extract_into_tensor(
-                    self.posterior_log_variance_clipped, t, x_t.shape
-                )
-                max_log = _extract_into_tensor(np.log(self.betas), t, x_t.shape)
-                frac = (model_var_values + 1) / 2
-                model_log_variance = frac * max_log + (1 - frac) * min_log
 
-                pred_xstart = self._predict_xstart_from_eps(x_t=x_t, t=t, eps=model_output)
-                model_mean, _, _ = self.q_posterior_mean_variance(
-                    x_start=pred_xstart, x_t=x_t, t=t)
-
-                noise = th.randn_like(x_t)
-                nonzero_mask = (
-                    (t != 0).float().view(-1, *([1] * (len(x_t.shape) - 1)))
-                )  # no noise when t == 0
-                images = model_mean + nonzero_mask * th.exp(0.5 * model_log_variance) * noise
-
-                terms["clip"] = self.clip_coeff * clip_loss(*clip(images, t, **model_kwargs))
-                terms["loss"] += terms["clip"]
         else:
             raise NotImplementedError(self.loss_type)
 

@@ -1,16 +1,21 @@
-# Diff-DALLE (WIP)
+# Diff-DALLE
 
-Diff-DALLE is a DDPM for text-to-image generation: 
--  This model consists of: 
-	- Transformer encoder for taking in the input text
-	- DDPM U-Net for generating an image conditioned on the input text
-		- Token-level input embeddings are fed from the encoder to the U-Net via encoder-decoder attention.
-		- Sequence-level input embedding is fed as the class embedding of DDPM.  
-	- CLIP classifier for guiding the sampling.
-- We plan to train with large amount of computes and dataset to release a pretrained model.
-- We also plan to investigate how well unconditional image generation is improved by generating alt-texts/captions with a fine-tuned GPT-2/3 and then generating images with Diff-DALLE. 
+Diff-DALLE is DDPM + CLIP with 1.5B parameters for text-to-image generation. This repo allows both training and inference of this model. The links to pretrained weights and Colab notebook are attached.   
 
-We have designed Diff-DALLE by starting from [Guided Diffusion](https://github.com/openai/guided-diffusion/) by Dhariwal et. al. Hence, its design, hyperparameter choice and code are heavily inspired by this.  
+-  Diff-DALLE consists of three generators and one classifier:
+	- Generators are responsible for: 
+		- 64x64 text-to-image generation
+		- 64x64 -> 256x256 upscaling
+		- 256x256 -> 1024x1024 upscaling
+	- Each generator consists of:
+		- Transformer encoder for taking in the input text
+		- DDPM U-Net for generating an image conditioned on the input text
+			- Input embeddings are fed from the encoder to the U-Net via encoder-decoder attention.
+	- CLIP classifier trained on noised images from scratch for guiding the sampling.
+		- The image part of our CLIP uses the same architecture as in Guided Diffusion for better low-level guidance.
+- Pretrained model is trained on ~100M image-text pairs and ~40M high-resolution images with 32 A100 GPUs for ~6 weeks.
+
+We have designed Diff-DALLE by starting from [Guided Diffusion](https://github.com/openai/guided-diffusion/) by Dhariwal et. al. Hence, its design, hyperparameter choice and code are heavily inspired by this. [Concurrent work](https://twitter.com/RiversHaveWings/status/1417629128124076032) by [Katherine Crowson](https://twitter.com/RiversHaveWings) on Guided Diffusion + CLIP is also worth noting (comparison below). 
 
 #### Major steps to follow
 1.  Installation
@@ -21,9 +26,11 @@ We have designed Diff-DALLE by starting from [Guided Diffusion](https://github.c
 
 ## Acknowledgment 
 Thanks to everyone who have helped out one way or another (listed alphabetically):
-* [EleutherAI](https://www.eleuther.ai/) for providing their computational resources for initial experiments
+* [Ben Wang](https://github.com/kingoflolz) for offering some valuable advices.
+* [CoreWeave](https://www.coreweave.com/) and [EleutherAI](https://www.eleuther.ai/) for providing their computational resources for training.
+* [Christoph Schuhmann](http://christoph-schuhmann.de/), [Richard Vencu](https://github.com/rvencu), [Romain Beaumont](https://rom1504.fr/) and many others in dalle-pytorch Discord server for building the Crawling@Home dataset, which was used along with our high-resolution dataset. Notably, Romain helped us to download the dataset.
 * [Shivanshu Purohit](https://github.com/ShivanshuPurohit) for securing and setting up the computational resources used for this project 
-* [Spell](https://spell.ml/) for offering us a generous grant of $40,000 from [Spell Open Research Grant](https://spell.ml/blog/spell-open-research-grant-YIMtSxEAACQAKm81), which was used for training our model 
+* [Spell](https://spell.ml/) for offering us a generous grant of $40,000 worth-compute from [Spell Open Research Grant](https://spell.ml/blog/spell-open-research-grant-YIMtSxEAACQAKm81) 
 
 ## Installation
 
@@ -36,47 +43,35 @@ pip install -e .
 This should install the `diff_dalle` python package that the scripts depend on.
 
 ##### Caveat
-* If your accelerator is Ampere (e.g. A100), you should run this model on [NGC](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) to avoid substantial slowdown on mixed-precision convolutions due to a bug of PyTorch (<=1.9).
+* Make sure to use the newest stable version of PyTorch (1.9.0), as older version slows down the training when used with Ampere (e.g. A100) architecture.
 
-## Preparing data (WIP)
+## Preparing data
 
-For each dataset, the dataset directory `/dataset` (or any directory name of your choice) should consist of two subdirectories `dataset/images` and `dataset/texts`, where each image-text pair should have the same filename and (relative) path in each subdirectory, (e.g. `dataset/images/01/0000001.jpg` and `dataset/texts/01/0000001.jpg`). 
-
-For creating your own dataset, simply dump all of your images into a directory with ".jpg", ".jpeg", or ".png" extensions. Subdirectories will automatically be enumerated as well, so the images can be organized into a recursive structure (although the directory names will be ignored, and the underscore prefixes are used as names). Likewise for text files, but only ".txt" extension is accepted, and make sure that they have the same relative path as the paired image. 
-
-The images will automatically be scaled and center-cropped by the data-loading pipeline. Simply pass `--data_dir path/to/dataset` to the script, and it will take care of the rest. For larger datasets, it is recommended to set `-- index_dir path/to/index` instead of `data_dir`, which directs to the json index file that stores all the paths of text files, since search for all the text files before each run becomes more time-consuming. An index file can be produced by running the following: 
-```bash
-python make_index.py --data_path path/to/dataset --img_min_sizes 64,512 \
---index_path_save index.json
-``` 
-This takes several minutes per 1M files. 
-
-For training a medium-sized model, you can download Conceptual Captions 12M dataset from
-* [https://github.com/robvanvolt/DALLE-datasets/blob/main/general/cc12m.py](https://github.com/robvanvolt/DALLE-datasets/blob/main/general/cc12m.py)
-
-Beware that this costs 1TB of storage and more than a day of processing time. PR of adding a smaller dataset for demonstration is encouraged.
+Create a directory with containing shards of webdataset consisting of images (and texts if applicable) and set `index_dir` to the path to the directory. 
+* C@H dataset (400M CLIP-filtered image-text pairs) will be available at the-eye soon
+	* Until then you can download the images at https://github.com/rom1504/img2dataset
+* ~35M high-resolution image dataset at https://the-eye.eu/eleuther_staging/yfcc2/
 
 ## Training
 
 ### General remarks
-* In the case of using perceptual loss, you need to first train a classifier, after which you can start training a generator. This feature is optional.
 * To generate with image resolution larger than 128, cascading training should be used. 
 	* For example, for 256 x 256  images, you need to train 64 x 64 generator + classifier as well as 256 x 256 upsampling generator (optionally + classifier).   
 	* While a model with a higher-resolution hierarchy costs more FLOPS per image, you can mitigate the increased cost without substantial performance degradation by doing the following:
 		* Use a smaller model  (e.g. `num_channels` = 256 for 64 x 64, while = 128 for 256 x 256)
-		* Reduce `batch_size` (e.g. `batch_size = 2048` for 64 x 64, while = 256 for 256 x 256)
+		* Reduce `batch_size` (e.g. `batch_size` = 2048 for 64 x 64, while = 256 for 256 x 256)
 	* This way, you can aim for spending about the same amount of computes on each hierarchy. 
 	* It is often more efficient to make the number of sampling steps larger for low-res hierarchy than high-res hierarchy.
 
-To train your model, you should first decide some hyperparameters. We will split up our hyperparameters into three groups: model architecture, diffusion process (for generator), and training flags. Here is an example:
-
 ### Logs & checkpoints
 
-The logs and checkpoints will be written to a logging directory determined by the `OPENAI_LOGDIR` environment variable (e.g. `export OPENAI_LOGDIR="/path/to/logdir`). If it is not set, then a temporary directory will be created in `/tmp`.
+The logs and checkpoints will be written to a logging directory determined by the `OPENAI_LOGDIR` environment variable (e.g. `export OPENAI_LOGDIR=/path/to/logdir`). If it is not set, then a temporary directory will be created in `/tmp`.
 
 The training scripts below save checkpoints to `.pt` files in the logging directory. These checkpoints will have names like `ema_0.9999_200000.pt` and `model200000.pt`. You will likely want to sample from the EMA models, since those produce much better samples.
 
 ### Generator
+To train your model, you should first decide some hyperparameters. We will split up our hyperparameters into three groups: model architecture, diffusion process (for generator), and training flags. Here is an example:
+
 ```bash
 MODEL_FLAGS="--image_size 64 --num_channels 128 --num_res_blocks 2 --enc_attn_dim 512 \
 --dropout 0.1 --use_fp16 True"
@@ -88,8 +83,6 @@ Once you have setup your hyper-parameters, you can run an experiment like so:
 ```bash
 python scripts/train_genrator.py --data_dir path/to/images $MODEL_FLAGS $DIFFUSION_FLAGS $TRAIN_FLAGS
 ```
-##### Perceptual loss (not recommended)
-To add perceptual loss, you can specify `--clip_coeff` and `--clip_resume_checkpoint` for `TRAIN_FLAGS` and add the `CLASSIFIER_FLAGS` for the corresponding classifier. While this idea makes sense, we have not trained with this option stably yet. 
 
 ##### Cascaded training
 * For generator, you also need to modify `small_size` to the size of the input image. 
@@ -101,7 +94,7 @@ CLASSIFIER_FLAGS="--image_size 64 --classifier_depth 2 --classifier_width 128 \
 --classifier_enc_attn_dim 512 --use_fp16 True"
 DIFFUSION_FLAGS="--noise_schedule cosine"
 TRAIN_FLAGS="--iterations 300000 --batch_size 128 --lr 3e-4 --weight_decay 0.1 \
---text_aug_factor 16"
+--"
 ```
 As in generator training, you can run an experiment for classifier as:
 
@@ -112,8 +105,8 @@ python scripts/train_classifier.py --data_dir path/to/train_data \
 ##### Cascaded training
 * For this, it suffices to modify `image_size`, model size, `batch_size`, etc. and run with the exact same command.
 
-##### Recommendations
-* Due to the use of contrastive loss, using a larger batch size is more effective. Since FLOPS per text is much cheaper than FLOPS per image, we tried increasing `text_aug_factor` (= text batch size / image batch size) above 1 by sampling random texts as negatives. Note that gradient accumulation does not equate to using a larger batch size under contrastive loss.
+##### Remarks
+* We have added [gradient caching](https://github.com/luyug/GradCache) option to enable effective gradient accumulation with contrastive loss.
 * Unlike the generator, overfitting is more likely. Hence, it is recommended to take the checkpoint with the best validation loss.
 
 ### Distributed training
@@ -140,7 +133,7 @@ python scripts/sample.py --model_path /path/to/model_ema.pt \
 --classifier_path /path/to/classifier.pt --data_dir path/to/texts $MODEL_FLAGS \
 $CLASSIFIER_FLAGS $DIFFUSION_FLAGS
 ```
-You can remove the relevant parts if classifier-augmented sampling is not needed.
+You can remove the relevant parts if classifier-augmented sampling is not used.
 
 Again, this will save results to a logging directory. Samples are saved as a large `npz` file. A small subset of the samples is also saved as a grid image in jpg and a txt file. 
 
@@ -185,6 +178,7 @@ For model checkpoints (if available) and run flags we have attempted, please ref
 	- [ ] Test sampling with classifier (no bug; performance not checked)
 - [ ] Add the code for preparing a small dataset for demo
 - [ ] Perform large-scale training
+- [ ] Add more details on parameters, compute, dataset size ...
 - [ ] Add evaluation metrics (e.g. Precision & Recall, FID, etc) and perform ablations
 - [ ] Improve the documentation
 - [ ] Release a pretrained model, colab notebook and web demo 
