@@ -1,4 +1,4 @@
-# Diff-DALLE
+# Diff-DALLE (WIP)
 
 Diff-DALLE is DDPM + CLIP with 1.5B parameters for text-to-image generation. This repo allows both training and inference of this model. The links to pretrained weights and Colab notebook are attached.   
 
